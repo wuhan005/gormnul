@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/lib/pq"
 	"gorm.io/datatypes"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -40,6 +41,13 @@ type hookFixture struct {
 	Payload datatypes.JSON `gorm:"type:jsonb"`
 }
 
+type collectionFixture struct {
+	ID      int64 `gorm:"primaryKey;autoIncrement:false"`
+	Payload datatypes.JSONMap
+	Tags    pq.StringArray `gorm:"type:text[]"`
+	Labels  pq.StringArray `gorm:"type:varchar(64)[]"`
+}
+
 func (h *hookFixture) BeforeSave(_ *gorm.DB) error {
 	h.Notes = "hook\x00value"
 	h.Payload = datatypes.JSON(`{"s":"hook\u0000value"}`)
@@ -64,7 +72,7 @@ func TestGORMPostgres(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = pool.Close() })
 
-	if err := db.AutoMigrate(&releaseFixture{}, &serializedFixture{}, &defaultFixture{}, &hookFixture{}); err != nil {
+	if err := db.AutoMigrate(&releaseFixture{}, &serializedFixture{}, &defaultFixture{}, &hookFixture{}, &collectionFixture{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -95,14 +103,6 @@ func TestGORMPostgres(t *testing.T) {
 			Optional:     sql.NullString{String: "optional\x00text", Valid: true},
 			Binary:       []byte{'a', 0, 'b'},
 		}
-	}
-	create := func(t *testing.T) releaseFixture {
-		t.Helper()
-		row := newRow()
-		if err := db.Create(&row).Error; err != nil {
-			t.Fatal(err)
-		}
-		return row
 	}
 	check := func(t *testing.T, id int64, note string) {
 		t.Helper()
@@ -139,10 +139,139 @@ func TestGORMPostgres(t *testing.T) {
 		}
 	}
 
-	t.Run("create_struct", func(t *testing.T) {
-		row := create(t)
-		check(t, row.ID, "修复问题")
-	})
+	writeTests := []struct {
+		name      string
+		persisted bool
+		write     func(row *releaseFixture) error
+		wantNotes string
+	}{
+		{
+			name:      "create_struct",
+			write:     func(row *releaseFixture) error { return db.Create(row).Error },
+			wantNotes: "修复问题",
+		},
+		{
+			name: "create_map",
+			write: func(row *releaseFixture) error {
+				return db.Model(&releaseFixture{}).Create(map[string]any{
+					"id":            row.ID,
+					"release_notes": row.ReleaseNotes,
+					"raw_json":      dirtyJSON,
+					"nullable":      row.Nullable,
+					"optional":      row.Optional,
+					"binary":        row.Binary,
+				}).Error
+			},
+			wantNotes: "修复问题",
+		},
+		{
+			name: "skip_hooks",
+			write: func(row *releaseFixture) error {
+				return db.Session(&gorm.Session{SkipHooks: true}).Create(row).Error
+			},
+			wantNotes: "修复问题",
+		},
+		{
+			name: "json_looking_text_untouched",
+			write: func(row *releaseFixture) error {
+				row.ReleaseNotes = dirtyJSON
+				return db.Create(row).Error
+			},
+			wantNotes: dirtyJSON,
+		},
+		{
+			name: "transaction_and_prepared_statements",
+			write: func(row *releaseFixture) error {
+				return db.Session(&gorm.Session{PrepareStmt: true}).Transaction(func(tx *gorm.DB) error {
+					return tx.Create(row).Error
+				})
+			},
+			wantNotes: "修复问题",
+		},
+		{
+			name:      "save",
+			persisted: true,
+			write: func(row *releaseFixture) error {
+				row.ReleaseNotes = "save\x00value"
+				return db.Save(row).Error
+			},
+			wantNotes: "savevalue",
+		},
+		{
+			name:      "updates_map",
+			persisted: true,
+			write: func(row *releaseFixture) error {
+				return db.Model(row).Updates(map[string]any{"release_notes": "map\x00value", "raw_json": dirtyJSON}).Error
+			},
+			wantNotes: "mapvalue",
+		},
+		{
+			name:      "updates_struct_nul_only_becomes_empty",
+			persisted: true,
+			write: func(row *releaseFixture) error {
+				return db.Model(row).Updates(releaseFixture{ReleaseNotes: "\x00"}).Error
+			},
+			wantNotes: "",
+		},
+		{
+			name:      "updates_struct_original_zero_is_omitted",
+			persisted: true,
+			write: func(row *releaseFixture) error {
+				return db.Model(row).Updates(releaseFixture{}).Error
+			},
+			wantNotes: "修复问题",
+		},
+		{
+			name:      "update_column",
+			persisted: true,
+			write: func(row *releaseFixture) error {
+				return db.Model(row).UpdateColumn("release_notes", "column\x00value").Error
+			},
+			wantNotes: "columnvalue",
+		},
+		{
+			name:      "update_columns_map",
+			persisted: true,
+			write: func(row *releaseFixture) error {
+				return db.Model(row).UpdateColumns(map[string]any{"release_notes": "columns\x00value", "raw_json": dirtyJSON}).Error
+			},
+			wantNotes: "columnsvalue",
+		},
+		{
+			name:      "on_conflict_update_all",
+			persisted: true,
+			write: func(row *releaseFixture) error {
+				row.ReleaseNotes = "upsert\x00value"
+				return db.Clauses(clause.OnConflict{UpdateAll: true}).Create(row).Error
+			},
+			wantNotes: "upsertvalue",
+		},
+		{
+			name:      "on_conflict_explicit_assignments",
+			persisted: true,
+			write: func(row *releaseFixture) error {
+				return db.Clauses(clause.OnConflict{
+					Columns:   []clause.Column{{Name: "id"}},
+					DoUpdates: clause.Assignments(map[string]any{"release_notes": "explicit\x00value", "raw_json": dirtyJSON}),
+				}).Create(row).Error
+			},
+			wantNotes: "explicitvalue",
+		},
+	}
+	for _, tc := range writeTests {
+		t.Run(tc.name, func(t *testing.T) {
+			row := newRow()
+			if tc.persisted {
+				if err := db.Create(&row).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := tc.write(&row); err != nil {
+				t.Fatal(err)
+			}
+			check(t, row.ID, tc.wantNotes)
+		})
+	}
 
 	t.Run("batch_pointer_slice", func(t *testing.T) {
 		a, b := newRow(), newRow()
@@ -151,22 +280,6 @@ func TestGORMPostgres(t *testing.T) {
 		}
 		check(t, a.ID, "修复问题")
 		check(t, b.ID, "修复问题")
-	})
-
-	t.Run("create_map", func(t *testing.T) {
-		row := newRow()
-		values := map[string]any{
-			"id":            row.ID,
-			"release_notes": row.ReleaseNotes,
-			"raw_json":      dirtyJSON,
-			"nullable":      row.Nullable,
-			"optional":      row.Optional,
-			"binary":        row.Binary,
-		}
-		if err := db.Model(&releaseFixture{}).Create(values).Error; err != nil {
-			t.Fatal(err)
-		}
-		check(t, row.ID, "修复问题")
 	})
 
 	t.Run("create_batch_map", func(t *testing.T) {
@@ -185,87 +298,6 @@ func TestGORMPostgres(t *testing.T) {
 		}
 	})
 
-	t.Run("save", func(t *testing.T) {
-		row := create(t)
-		row.ReleaseNotes = "save\x00value"
-		if err := db.Save(&row).Error; err != nil {
-			t.Fatal(err)
-		}
-		check(t, row.ID, "savevalue")
-	})
-
-	t.Run("updates_map", func(t *testing.T) {
-		row := create(t)
-		updates := map[string]any{"release_notes": "map\x00value", "raw_json": dirtyJSON}
-		if err := db.Model(&row).Updates(updates).Error; err != nil {
-			t.Fatal(err)
-		}
-		check(t, row.ID, "mapvalue")
-	})
-
-	t.Run("updates_struct_nul_only_becomes_empty", func(t *testing.T) {
-		row := create(t)
-		if err := db.Model(&row).Updates(releaseFixture{ReleaseNotes: "\x00"}).Error; err != nil {
-			t.Fatal(err)
-		}
-		check(t, row.ID, "")
-	})
-
-	t.Run("updates_struct_original_zero_is_omitted", func(t *testing.T) {
-		row := create(t)
-		if err := db.Model(&row).Updates(releaseFixture{}).Error; err != nil {
-			t.Fatal(err)
-		}
-		check(t, row.ID, "修复问题")
-	})
-
-	t.Run("update_column", func(t *testing.T) {
-		row := create(t)
-		if err := db.Model(&row).UpdateColumn("release_notes", "column\x00value").Error; err != nil {
-			t.Fatal(err)
-		}
-		check(t, row.ID, "columnvalue")
-	})
-
-	t.Run("update_columns_map", func(t *testing.T) {
-		row := create(t)
-		updates := map[string]any{"release_notes": "columns\x00value", "raw_json": dirtyJSON}
-		if err := db.Model(&row).UpdateColumns(updates).Error; err != nil {
-			t.Fatal(err)
-		}
-		check(t, row.ID, "columnsvalue")
-	})
-
-	t.Run("skip_hooks", func(t *testing.T) {
-		row := newRow()
-		if err := db.Session(&gorm.Session{SkipHooks: true}).Create(&row).Error; err != nil {
-			t.Fatal(err)
-		}
-		check(t, row.ID, "修复问题")
-	})
-
-	t.Run("on_conflict_update_all", func(t *testing.T) {
-		row := create(t)
-		row.ReleaseNotes = "upsert\x00value"
-		row.RawJSON = datatypes.JSON(dirtyJSON)
-		if err := db.Clauses(clause.OnConflict{UpdateAll: true}).Create(&row).Error; err != nil {
-			t.Fatal(err)
-		}
-		check(t, row.ID, "upsertvalue")
-	})
-
-	t.Run("on_conflict_explicit_assignments", func(t *testing.T) {
-		row := create(t)
-		onConflict := clause.OnConflict{
-			Columns:   []clause.Column{{Name: "id"}},
-			DoUpdates: clause.Assignments(map[string]any{"release_notes": "explicit\x00value", "raw_json": dirtyJSON}),
-		}
-		if err := db.Clauses(onConflict).Create(&row).Error; err != nil {
-			t.Fatal(err)
-		}
-		check(t, row.ID, "explicitvalue")
-	})
-
 	t.Run("where_parameters_untouched", func(t *testing.T) {
 		stmt := db.Session(&gorm.Session{DryRun: true}).
 			Model(&releaseFixture{}).
@@ -278,15 +310,6 @@ func TestGORMPostgres(t *testing.T) {
 		if len(stmt.Vars) != 2 || stmt.Vars[0] != "writeclean" || stmt.Vars[1] != "match\x00original" {
 			t.Fatalf("parameters changed incorrectly: %#v", stmt.Vars)
 		}
-	})
-
-	t.Run("json_looking_text_untouched", func(t *testing.T) {
-		row := newRow()
-		row.ReleaseNotes = dirtyJSON
-		if err := db.Create(&row).Error; err != nil {
-			t.Fatal(err)
-		}
-		check(t, row.ID, dirtyJSON)
 	})
 
 	t.Run("sql_null_and_json_null_distinct", func(t *testing.T) {
@@ -309,31 +332,40 @@ func TestGORMPostgres(t *testing.T) {
 		}
 	})
 
-	t.Run("nul_key_rejected_before_execution", func(t *testing.T) {
-		row := newRow()
-		row.RawJSON = datatypes.JSON(`{"a\u0000":1,"a":2}`)
-		err := db.Create(&row).Error
-		if err == nil || !strings.Contains(err.Error(), "gormnul release_fixtures.raw_json: NUL in JSON key") {
-			t.Fatalf("expected local key error, got %v", err)
-		}
+	rejectTests := []struct {
+		name    string
+		rawJSON string
+		wantErr string
+	}{
+		{
+			name:    "nul_key_rejected_before_execution",
+			rawJSON: `{"a\u0000":1,"a":2}`,
+			wantErr: "gormnul release_fixtures.raw_json: NUL in JSON key",
+		},
+		{
+			name:    "invalid_json_rejected_before_execution",
+			rawJSON: `{"bad":`,
+			wantErr: "gormnul release_fixtures.raw_json: invalid JSON",
+		},
+	}
+	for _, tc := range rejectTests {
+		t.Run(tc.name, func(t *testing.T) {
+			row := newRow()
+			row.RawJSON = datatypes.JSON(tc.rawJSON)
+			err := db.Create(&row).Error
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
 
-		var count int64
-		if err := db.Model(&releaseFixture{}).Where("id = ?", row.ID).Count(&count).Error; err != nil {
-			t.Fatal(err)
-		}
-		if count != 0 {
-			t.Fatal("rejected row was persisted")
-		}
-	})
-
-	t.Run("invalid_json_rejected_before_execution", func(t *testing.T) {
-		row := newRow()
-		row.RawJSON = datatypes.JSON(`{"bad":`)
-		err := db.Create(&row).Error
-		if err == nil || !strings.Contains(err.Error(), "gormnul") {
-			t.Fatalf("expected local validation error, got %v", err)
-		}
-	})
+			var count int64
+			if err := db.Model(&releaseFixture{}).Where("id = ?", row.ID).Count(&count).Error; err != nil {
+				t.Fatal(err)
+			}
+			if count != 0 {
+				t.Fatal("rejected row was persisted")
+			}
+		})
+	}
 
 	t.Run("omitted_invalid_field_is_not_processed", func(t *testing.T) {
 		row := newRow()
@@ -387,21 +419,64 @@ func TestGORMPostgres(t *testing.T) {
 		}
 	})
 
-	t.Run("transaction_and_prepared_statements", func(t *testing.T) {
-		row := newRow()
-		err := db.Session(&gorm.Session{PrepareStmt: true}).Transaction(func(tx *gorm.DB) error {
-			return tx.Create(&row).Error
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		check(t, row.ID, "修复问题")
-	})
-
 	t.Run("typed_json_table_map_without_model", func(t *testing.T) {
 		values := map[string]any{"id": newID(), "raw_json": datatypes.JSON(dirtyJSON)}
 		if err := db.Table("release_fixtures").Create(values).Error; err != nil {
 			t.Fatal(err)
 		}
+	})
+
+	checkCollection := func(t *testing.T, id int64, payload, tags, labels string) {
+		t.Helper()
+		var gotPayload, gotTags, gotLabels string
+		query := `SELECT COALESCE(payload->>'s', ''), COALESCE(array_to_string(tags, ','), ''), COALESCE(array_to_string(labels, ','), '')
+			FROM collection_fixtures WHERE id = ?`
+		err := db.Raw(query, id).
+			Row().
+			Scan(&gotPayload, &gotTags, &gotLabels)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotPayload != payload || gotTags != tags || gotLabels != labels {
+			t.Fatalf("got payload=%q tags=%q labels=%q", gotPayload, gotTags, gotLabels)
+		}
+	}
+
+	t.Run("json_map_and_text_arrays", func(t *testing.T) {
+		row := collectionFixture{
+			ID:      1,
+			Payload: datatypes.JSONMap{"s": "a\x00b"},
+			Tags:    pq.StringArray{"a\x00b", "c"},
+			Labels:  pq.StringArray{"x\x00y"},
+		}
+		if err := db.Create(&row).Error; err != nil {
+			t.Fatal(err)
+		}
+		checkCollection(t, row.ID, "ab", "ab,c", "xy")
+
+		if row.Labels[0] != "x\x00y" {
+			t.Fatalf("input slice mutated: %q", row.Labels)
+		}
+	})
+
+	t.Run("text_arrays_updates_map", func(t *testing.T) {
+		row := collectionFixture{ID: 2}
+		if err := db.Create(&row).Error; err != nil {
+			t.Fatal(err)
+		}
+
+		updates := map[string]any{"tags": pq.StringArray{"u\x00v"}, "labels": pq.StringArray{"m\x00n"}}
+		if err := db.Model(&row).Updates(updates).Error; err != nil {
+			t.Fatal(err)
+		}
+		checkCollection(t, row.ID, "", "uv", "mn")
+	})
+
+	t.Run("json_map_table_map_without_model", func(t *testing.T) {
+		values := map[string]any{"id": 3, "payload": datatypes.JSONMap{"s": "a\x00b"}}
+		if err := db.Table("collection_fixtures").Create(values).Error; err != nil {
+			t.Fatal(err)
+		}
+		checkCollection(t, 3, "ab", "", "")
 	})
 }

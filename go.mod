@@ -3,6 +3,7 @@ module github.com/wuhan005/gormnul
 go 1.25.0
 
 require (
+	github.com/lib/pq v1.12.3
 	gorm.io/datatypes v1.2.7
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/gorm v1.31.1

@@ -41,7 +41,8 @@ func (Plugin) Initialize(db *gorm.DB) error {
 	return nil
 }
 
-// wrapClauseBuilder 先清洗子句里的写入值，再交给原有 builder；原 builder 为空时走 GORM 默认构建。
+// wrapClauseBuilder cleans write values in the clause, then delegates to the
+// previous builder, or to GORM's default build when there is none.
 func wrapClauseBuilder(previous clause.ClauseBuilder) clause.ClauseBuilder {
 	return func(c clause.Clause, builder clause.Builder) {
 		if stmt, ok := builder.(*gorm.Statement); ok {
@@ -141,7 +142,8 @@ func normalizeColumn(stmt *gorm.Statement, column string, value any) (any, error
 	return clean, nil
 }
 
-// normalizerFor 按列类型选择清洗函数，JSON 优先于文本；无需处理时返回 nil。
+// normalizerFor picks the cleaner for the column type, preferring JSON over
+// text. It returns nil when the value needs no cleaning.
 func normalizerFor(field *schema.Field, value any) func(any) (any, error) {
 	if field == nil {
 		// Typed JSON values remain identifiable in map writes without a model.
@@ -155,7 +157,7 @@ func normalizerFor(field *schema.Field, value any) func(any) (any, error) {
 	switch {
 	case field.TagSettings["SERIALIZER"] == "json", isJSONType(dataType), isJSONType(gormDataType):
 		return normalizeJSON
-	case isTextType(dataType), isTextType(gormDataType):
+	case isTextType(dataType), isTextType(gormDataType), isTextArrayType(dataType):
 		return normalizeText
 	default:
 		return nil
@@ -164,7 +166,7 @@ func normalizerFor(field *schema.Field, value any) func(any) (any, error) {
 
 func isJSONType(dataType string) bool {
 	switch strings.ToLower(dataType) {
-	case "json", "jsonb":
+	case "json", "jsonb", "jsonmap":
 		return true
 	}
 	return false
@@ -173,6 +175,24 @@ func isJSONType(dataType string) bool {
 func isTextType(dataType string) bool {
 	switch strings.ToLower(dataType) {
 	case "string", "text":
+		return true
+	}
+	return false
+}
+
+// isTextArrayType reports whether dataType is a one-dimensional text array,
+// such as text[] or varchar(64)[].
+func isTextArrayType(dataType string) bool {
+	elem, ok := strings.CutSuffix(strings.ToLower(strings.TrimSpace(dataType)), "[]")
+	if !ok {
+		return false
+	}
+	if i := strings.IndexByte(elem, '('); i >= 0 {
+		elem = elem[:i]
+	}
+
+	switch strings.TrimSpace(elem) {
+	case "text", "varchar", "character varying", "char", "character", "bpchar", "citext":
 		return true
 	}
 	return false
@@ -257,7 +277,8 @@ func normalizeJSON(value any) (any, error) {
 }
 
 func sanitizeJSON(raw []byte) ([]byte, error) {
-	// Decoder 只读取首个 JSON 值，需先整体校验以拒绝尾随内容。
+	// The decoder reads only the first JSON value, so validate the whole input
+	// first to reject trailing data.
 	if !json.Valid(raw) {
 		return nil, errors.New("invalid JSON")
 	}
