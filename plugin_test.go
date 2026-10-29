@@ -62,7 +62,7 @@ func TestGORMPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pool.Close()
+	t.Cleanup(func() { _ = pool.Close() })
 
 	if err := db.AutoMigrate(&releaseFixture{}, &serializedFixture{}, &defaultFixture{}, &hookFixture{}); err != nil {
 		t.Fatal(err)

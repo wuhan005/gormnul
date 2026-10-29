@@ -1,0 +1,82 @@
+name: Go
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/go.yml'
+  pull_request:
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/go.yml'
+permissions:
+  contents: read
+env:
+  GOPROXY: "https://proxy.golang.org"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.x
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14
+          args: --timeout=10m
+      - name: Run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+      - name: Check Go module tidiness
+        shell: bash
+        run: |
+          go mod tidy
+          STATUS=$(git status --porcelain)
+          if [ ! -z "$STATUS" ]; then
+            echo "Unstaged files:"
+            echo $STATUS
+            echo "Run 'go mod tidy' commit them"
+            exit 1
+          fi
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.x
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Run tests
+        run: go test -v -race ./...
+        env:
+          PG_NUL_DSN: "host=localhost port=5432 user=postgres password=postgres dbname=postgres sslmode=disable"

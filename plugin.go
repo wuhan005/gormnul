@@ -28,7 +28,7 @@ type Plugin struct{}
 func (Plugin) Name() string { return "postgres:nul_write_values" }
 
 func (Plugin) Initialize(db *gorm.DB) error {
-	if db.Dialector.Name() != "postgres" {
+	if db.Name() != "postgres" {
 		return errors.New("gormnul requires the postgres dialect")
 	}
 
@@ -47,7 +47,7 @@ func wrapClauseBuilder(previous clause.ClauseBuilder) clause.ClauseBuilder {
 		if stmt, ok := builder.(*gorm.Statement); ok {
 			clean, err := normalizeClause(stmt, c.Expression)
 			if err != nil {
-				builder.AddError(err)
+				_ = builder.AddError(err)
 				return
 			}
 			c.Expression = clean
