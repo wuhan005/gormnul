@@ -283,6 +283,12 @@ func sanitizeJSON(raw []byte) ([]byte, error) {
 		return nil, errors.New("invalid JSON")
 	}
 
+	// Valid JSON can only carry NUL as a \u0000 escape. Inputs without one are
+	// returned as is, keeping their exact text and skipping the costly rewrite.
+	if !bytes.Contains(raw, []byte(`\u0000`)) {
+		return raw, nil
+	}
+
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var value any

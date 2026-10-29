@@ -480,3 +480,94 @@ func TestGORMPostgres(t *testing.T) {
 		checkCollection(t, 3, "ab", "", "")
 	})
 }
+
+func TestSanitizeJSON(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr string
+	}{
+		{
+			name:  "clean_input_kept_verbatim",
+			input: `{"z": 1, "a": "<b> & c", "dup": 1, "dup": 2}`,
+			want:  `{"z": 1, "a": "<b> & c", "dup": 1, "dup": 2}`,
+		},
+		{
+			name:  "nul_escape_removed",
+			input: `{"s":"a\u0000b"}`,
+			want:  `{"s":"ab"}`,
+		},
+		{
+			name:  "nested_nul_and_big_number",
+			input: `{"n":7653202734459387904,"a":["\u0000x",null]}`,
+			want:  `{"a":["x",null],"n":7653202734459387904}`,
+		},
+		{
+			name:  "escaped_backslash_literal_kept",
+			input: `{"s":"\\u0000"}`,
+			want:  `{"s":"\\u0000"}`,
+		},
+		{
+			name:    "nul_key_rejected",
+			input:   `{"a\u0000":1}`,
+			wantErr: "NUL in JSON key",
+		},
+		{
+			name:    "invalid_json_rejected",
+			input:   `{"bad":`,
+			wantErr: "invalid JSON",
+		},
+		{
+			name:    "trailing_data_rejected",
+			input:   `{} {}`,
+			wantErr: "invalid JSON",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := sanitizeJSON([]byte(tc.input))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("got %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func BenchmarkNormalizeJSON(b *testing.B) {
+	items := make([]map[string]any, 100)
+	for i := range items {
+		items[i] = map[string]any{"id": i, "title": "item <" + strings.Repeat("x", 20) + ">", "tags": []string{"a", "b"}}
+	}
+	clean, err := json.Marshal(map[string]any{"items": items})
+	if err != nil {
+		b.Fatal(err)
+	}
+	dirty := strings.Replace(string(clean), `"item `, `"item\u0000 `, 1)
+
+	for _, bc := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "clean", payload: string(clean)},
+		{name: "dirty", payload: dirty},
+	} {
+		b.Run(bc.name, func(b *testing.B) {
+			b.SetBytes(int64(len(bc.payload)))
+			for b.Loop() {
+				if _, err := normalizeJSON(bc.payload); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
